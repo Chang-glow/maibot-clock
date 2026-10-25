@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>闹钟</title>
+<style>
+[hidden]{display:none!important}
+:root{--bg:var(--maibot-background,#f6f6f6);--surface:var(--maibot-surface,#fff);--soft:var(--maibot-soft,#f0f0f0);--ink:var(--maibot-foreground,#222);--muted:var(--maibot-muted,#777);--line:var(--maibot-border,#ddd);--accent:var(--maibot-primary,#4a7dff);--accent-soft:color-mix(in srgb,var(--maibot-primary,#4a7dff) 14%,var(--maibot-background,#f6f6f6));--danger:var(--maibot-danger,#d33);--danger-soft:color-mix(in srgb,var(--maibot-danger,#d33) 12%,var(--maibot-background,#f6f6f6));--radius:var(--maibot-radius,8px)}
+*{box-sizing:border-box}
+html,body{background-color:var(--bg);color:var(--ink);font-family:var(--maibot-font-body,inherit)}
+body{font-size:14px;line-height:1.6;margin:0}
+h2,h3,p{margin:0}h2{font-size:19px;letter-spacing:-.3px}h3{font-size:15px}
+small,.muted{color:var(--muted)}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.app{width:100%;padding:8px 8px 28px}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+.head p{font-size:12px;color:var(--muted);margin-top:4px}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.between{justify-content:space-between}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 8px;border:1px solid var(--line);border-radius:var(--radius);background:var(--soft);color:var(--muted);white-space:nowrap}
+.badge.active{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+.badge.failed{background:var(--danger-soft);border-color:transparent;color:var(--danger)}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.stat.maibot-card{padding:14px 18px}
+.stat .num{font:600 26px/1.35 var(--maibot-font-display,inherit);letter-spacing:-1px}
+.stat .lbl{font-size:12px;color:var(--muted)}
+.split{display:grid;grid-template-columns:340px minmax(0,1fr);gap:20px;align-items:start}
+.card+.card{margin-top:14px}
+.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}
+.card-head p{font-size:12px;color:var(--muted);margin-top:3px}
+.field{margin:14px 0}
+.field>label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.maibot-input,.maibot-select{width:100%;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);color:var(--ink);outline:none}
+textarea.maibot-input{resize:vertical;min-height:72px}
+.hint{font-size:12px;color:var(--muted);line-height:1.7;margin-top:6px}
+.full{width:100%}
+.notice{margin:0 0 16px;padding:11px 14px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);color:var(--muted);font-size:12px}
+.notice.error{color:var(--danger);background:var(--danger-soft);border-color:var(--danger)}
+.notice.good{color:var(--accent);background:var(--accent-soft);border-color:var(--accent)}
+.empty{padding:44px 20px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius);color:var(--muted);font-size:13px}
+.alarm.maibot-card{padding:16px 18px}
+.alarm-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.alarm-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.alarm-title strong{font-size:15px;overflow-wrap:anywhere}
+.alarm-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px}
+.alarm-message{font-size:13px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
+.alarm-error{font-size:12px;margin-top:8px;color:var(--danger);overflow-wrap:anywhere}
+.alarm-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px}
+.alarm-foot .mono{color:var(--muted)}
+button.small{padding:4px 10px;font-size:12px}
+@media(max-width:900px){.split{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body class="maibot-page">
+<main class="app">
+  <header class="head">
+    <div>
+      <h2>麦麦闹钟</h2>
+      <p>到点后提醒会作为主动任务交给 Planner，由麦麦决定怎么回应。</p>
+    </div>
+    <div class="row">
+      <span class="badge" id="zone">时区 —</span>
+      <span class="badge" id="now">—</span>
+      <button class="maibot-button" id="refresh">刷新</button>
+    </div>
+  </header>
+
+  <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+
+  <div class="stats">
+    <div class="stat maibot-card"><div class="num" id="stat-active">—</div><div class="lbl">进行中</div></div>
+    <div class="stat maibot-card"><div class="num" id="stat-failed">—</div><div class="lbl">已停止</div></div>
+    <div class="stat maibot-card"><div class="num" id="stat-total">—</div><div class="lbl">全部</div></div>
+  </div>
+
+  <div class="split">
+    <aside class="card maibot-card">
+      <div class="card-head"><div><h3>新建闹钟</h3><p>提醒内容会原样作为闹钟意图。</p></div></div>
+
+      <div class="field">
+        <label for="stream">聊天流</label>
+        <select class="maibot-select" id="stream"></select>
+        <p class="hint" id="stream-hint" hidden></p>
+      </div>
+
+      <div class="field">
+        <label for="kind">类型</label>
+        <select class="maibot-select" id="kind">
+          <option value="delay">延时</option>
+          <option value="at">固定时间</option>
+          <option value="cron">cron 表达式</option>
+        </select>
+        <p class="hint" id="kind-hint"></p>
+      </div>
+
+      <div class="field">
+        <label for="value">时间 / 间隔</label>
+        <input class="maibot-input" id="value" type="text" autocomplete="off" spellcheck="false">
+      </div>
+
+      <div class="field">
+        <label for="repeat">重复</label>
+        <select class="maibot-select" id="repeat">
+          <option value="once">仅一次</option>
+          <option value="count">限定次数</option>
+          <option value="forever">每次都提醒</option>
+        </select>
+      </div>
+
+      <div class="field" id="count-field" hidden>
+        <label for="count">次数</label>
+        <input class="maibot-input" id="count" type="number" min="1" max="100" step="1" value="3">
+      </div>
+
+      <div class="field">
+        <label for="message">提醒内容</label>
+        <textarea class="maibot-input" id="message" rows="3" placeholder="到点时交给麦麦的提醒文案"></textarea>
+      </div>
+
+      <div class="field">
+        <label for="label">备注（可选）</label>
+        <input class="maibot-input" id="label" type="text" maxlength="80" placeholder="便于在列表里识别">
+      </div>
+
+      <button class="maibot-button maibot-button-primary full" id="create">创建闹钟</button>
+    </aside>
+
+    <section>
+      <div class="card-head"><div><h3>当前闹钟</h3><p id="list-hint">正在读取…</p></div></div>
+      <div id="list"></div>
+    </section>
+  </div>
+</main>
+<script type="module">
+const $ = id => document.getElementById(id);
+const KIND_TEXT = { delay: '延时', at: '固定时间', cron: 'cron' };
+const KIND_HINTS = {
+  delay: '支持 10m、1h30m、90（秒）；重复时按同一间隔依次触发。',
+  at: '形如 2026-10-26 08:00，必须晚于当前时间，且只能提醒一次。',
+  cron: '标准 5 字段：分 时 日 月 周，例如 0 9 * * 1-5。',
+};
+const KIND_PLACEHOLDER = { delay: '10m', at: '2026-10-26 08:00', cron: '0 9 * * 1-5' };
+const STATUS_TEXT = { active: '进行中', failed: '已停止' };
+const state = { streams: [], alarms: [], busy: false, loading: false, again: false, timer: null };
+
+function notice(message, kind = '') {
+  const node = $('notice');
+  node.hidden = !message;
+  node.className = `notice ${kind}`;
+  node.textContent = message || '';
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function repeatText(alarm) {
+  if (alarm.repeat === 'forever') return '每次';
+  const remaining = alarm.remaining;
+  if (remaining === null || remaining === undefined) return '每次';
+  return remaining > 0 ? `剩余 ${remaining} 次` : '次数已用尽';
+}
+
+function renderStats() {
+  const active = state.alarms.filter(item => item.status === 'active').length;
+  const failed = state.alarms.length - active;
+  $('stat-active').textContent = String(active);
+  $('stat-failed').textContent = String(failed);
+  $('stat-total').textContent = String(state.alarms.length);
+}
+
+function alarmCard(alarm) {
+  const card = el('article', 'alarm maibot-card');
+
+  const head = el('div', 'alarm-head');
+  const title = el('div', 'alarm-title');
+  title.append(el('strong', '', alarm.title || '未命名提醒'));
+  title.append(el('span', `badge ${alarm.status === 'active' ? 'active' : 'failed'}`, STATUS_TEXT[alarm.status] || alarm.status));
+  title.append(el('span', 'badge', alarm.stream_name || '未知聊天'));
+  head.append(title);
+
+  if (alarm.status === 'active') {
+    const cancel = el('button', 'maibot-button maibot-button-danger small', '取消');
+    cancel.dataset.cancel = alarm.id;
+    cancel.disabled = state.busy;
+    head.append(cancel);
+  }
+  card.append(head);
+
+  const meta = el('div', 'alarm-meta');
+  meta.append(el('span', '', `下次触发 ${alarm.next_fire_text}`));
+  meta.append(el('span', '', `${KIND_TEXT[alarm.kind] || alarm.kind} · ${alarm.value}`));
+  meta.append(el('span', '', repeatText(alarm)));
+  if (alarm.repeat === 'count') meta.append(el('span', '', `已触发 ${alarm.fired_count}/${alarm.repeat_total}`));
+  card.append(meta);
+
+  card.append(el('p', 'alarm-message', alarm.message));
+  if (alarm.last_error) card.append(el('p', 'alarm-error', `上次失败：${alarm.last_error}`));
+
+  const foot = el('div', 'alarm-foot');
+  foot.append(el('span', 'mono', `id ${alarm.id}`));
+  foot.append(el('span', 'mono', alarm.last_fire_at ? `上次触发 ${alarm.last_fire_at.slice(5, 16).replace('T', ' ')}` : '尚未触发'));
+  card.append(foot);
+  return card;
+}
+
+function renderList() {
+  const list = $('list');
+  list.textContent = '';
+  if (!state.alarms.length) {
+    list.append(el('div', 'empty', '这里还没有闹钟。让麦麦自己定一个，或在左侧手动创建。'));
+  } else {
+    for (const alarm of state.alarms) list.append(alarmCard(alarm));
+  }
+  renderStats();
+}
+
+function renderStreams() {
+  const select = $('stream');
+  const previous = select.value;
+  select.textContent = '';
+  if (!state.streams.length) return;
+  for (const info of state.streams) {
+    const option = el('option', '', info.name);
+    option.value = info.stream_id;
+    select.append(option);
+  }
+  if (state.streams.some(info => info.stream_id === previous)) select.value = previous;
+}
+
+function applyKind() {
+  const kind = $('kind').value;
+  $('kind-hint').textContent = KIND_HINTS[kind] || '';
+  $('value').placeholder = KIND_PLACEHOLDER[kind] || '';
+  const repeat = $('repeat');
+  const onceOption = repeat.querySelector('option[value="once"]');
+  const onlyOnce = kind === 'at';
+  for (const option of repeat.options) {
+    if (option.value !== 'once') option.disabled = onlyOnce;
+  }
+  if (onlyOnce) repeat.value = 'once';
+  onceOption.textContent = onlyOnce ? '仅一次（固定时间）' : '仅一次';
+  syncRepeat();
+}
+
+function syncRepeat() {
+  $('count-field').hidden = $('repeat').value !== 'count';
+}
+
+function setBusy(busy) {
+  state.busy = busy;
+  $('create').disabled = busy;
+  $('refresh').disabled = busy;
+  for (const node of document.querySelectorAll('[data-cancel]')) node.disabled = busy;
+}
+
+async function load(silent = false) {
+  if (state.loading || state.busy) { state.again = true; return; }
+  state.loading = true;
+  if (!silent) $('list-hint').textContent = '正在读取…';
+  try {
+    const data = await maibot.query('alarms');
+    if (!data || data.ok !== true) throw new Error((data && data.error) || '读取闹钟失败');
+    state.streams = Array.isArray(data.streams) ? data.streams : [];
+    state.alarms = Array.isArray(data.alarms) ? data.alarms : [];
+    $('zone').textContent = `时区 ${data.timezone || '—'}`;
+    $('now').textContent = data.now ? `服务器时间 ${data.now.slice(5, 16).replace('T', ' ')}` : '—';
+    renderStreams();
+    renderList();
+    const hint = $('stream-hint');
+    hint.hidden = state.streams.length > 0;
+    hint.textContent = data.stream_error || '没有可用的聊天流，先让麦麦收到一条消息再试。';
+    $('list-hint').textContent = state.alarms.length ? `共 ${state.alarms.length} 个` : '暂无闹钟';
+  } catch (error) {
+    $('list-hint').textContent = '读取失败';
+    notice(String(error.message || error).replace(/^ApiError:\s*/, ''), 'error');
+  } finally {
+    state.loading = false;
+    if (state.again) { state.again = false; void load(true); }
+  }
+}
+
+async function createAlarm() {
+  if (state.busy) return;
+  const stream_id = $('stream').value;
+  const kind = $('kind').value;
+  const value = $('value').value.trim();
+  const message = $('message').value.trim();
+  const repeat = $('repeat').value;
+  const label = $('label').value.trim();
+  if (!stream_id) { notice('请选择聊天流', 'error'); return; }
+  if (!value) { notice('请填写时间或间隔', 'error'); return; }
+  if (!message) { notice('请填写提醒内容', 'error'); return; }
+  const args = { stream_id, kind, value, message, repeat, label };
+  if (repeat === 'count') {
+    const count = Number($('count').value);
+    if (!Number.isInteger(count) || count < 1 || count > 100) { notice('次数需为 1–100 的整数', 'error'); return; }
+    args.count = count;
+  }
+  setBusy(true);
+  notice('正在创建…');
+  try {
+    const result = await maibot.action('create', args);
+    if (!result || result.ok !== true) throw new Error((result && result.error) || '创建失败');
+    notice(result.content || '已创建闹钟', 'good');
+    $('value').value = '';
+    $('message').value = '';
+    $('label').value = '';
+  } catch (error) {
+    notice(String(error.message || error).replace(/^ApiError:\s*/, ''), 'error');
+  } finally {
+    setBusy(false);
+    void load(true);
+  }
+}
+
+async function cancelAlarm(alarmId) {
+  if (state.busy) return;
+  setBusy(true);
+  notice('正在取消…');
+  try {
+    const result = await maibot.action('cancel', { alarm_id: alarmId });
+    if (!result || result.ok !== true) throw new Error((result && result.error) || '取消失败');
+    notice(result.content || '已取消闹钟', 'good');
+  } catch (error) {
+    notice(String(error.message || error).replace(/^ApiError:\s*/, ''), 'error');
+  } finally {
+    setBusy(false);
+    void load(true);
+  }
+}
+
+document.addEventListener('click', event => {
+  const node = event.target.closest('button');
+  if (!node || node.disabled) return;
+  if (node.dataset.cancel) void cancelAlarm(node.dataset.cancel);
+});
+
+$('refresh').addEventListener('click', () => void load());
+$('create').addEventListener('click', () => void createAlarm());
+$('kind').addEventListener('change', applyKind);
+$('repeat').addEventListener('change', syncRepeat);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) void load(true); });
+
+applyKind();
+await load();
+state.timer = setInterval(() => { if (!document.hidden) void load(true); }, 15000);
+</script>
+</body>
+</html>

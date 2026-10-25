@@ -18,6 +18,17 @@
 - `message`：设置时写好的提醒内容，到点作为主动任务意图交给创建闹钟的聊天流，由 Planner 决定后续动作。
 - 闹钟只属于创建它的聊天流，`clock_list` / `clock_cancel` 只能看到本聊天的闹钟。
 
+## WebUI
+
+插件在 WebUI 侧边栏注册「闹钟」页（自定义页面，`webui/alarms.html`），可以：
+
+- 查看所有聊天流的闹钟：状态、下次触发时间、剩余次数、提醒内容、最近一次错误；
+- 选择聊天流后手动创建闹钟，参数与 `clock_set` 一致；
+- 取消任意闹钟（带二次确认）。
+
+页面通过 `clock_alarms` / `clock_create` / `clock_cancel` 三个静态 API 调用插件，
+聊天流名称来自 `chat.get_all_streams`；页面不直接发送消息，到点仍由 Planner 决定回应。
+
 ## 配置
 
 首次加载时由 MaiBot 自动生成 `config.toml`。常用项：

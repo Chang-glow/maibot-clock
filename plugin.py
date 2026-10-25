@@ -6,6 +6,9 @@
 
 到点后插件把设置时写好的文案作为主动任务意图交给 Planner，由模型自己看到
 这条提醒并决定要不要回复、怎么回复，插件不直接向聊天发送消息。
+
+WebUI 侧边栏的「闹钟」页通过 ``clock_alarms`` / ``clock_create`` / ``clock_cancel``
+三个静态 API 手动管理全部聊天流的闹钟。
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import os
 import re
 import uuid
 
-from maibot_sdk import MaiBotPlugin, Tool
+from maibot_sdk import API, MaiBotPlugin, Tool
 from maibot_sdk.config import Field, PluginConfigBase
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
@@ -676,40 +679,75 @@ class ClockPlugin(MaiBotPlugin):
     )
     async def clock_set(self, **kwargs: Any) -> dict[str, Any]:
         """LLM 工具：设置闹钟。"""
-        stream_id = str(kwargs.get("stream_id") or "").strip()
-        platform = str(kwargs.get("platform") or "").strip()
-        kind = str(kwargs.get("kind") or "").strip().lower()
-        value = str(kwargs.get("value") or "").strip()
-        message = str(kwargs.get("message") or "").strip()
-        repeat = str(kwargs.get("repeat") or "once").strip().lower()
-        label = str(kwargs.get("label") or "").strip()[:64]
+        alarm, error = await self._create_alarm(
+            stream_id=str(kwargs.get("stream_id") or ""),
+            platform=str(kwargs.get("platform") or ""),
+            kind=str(kwargs.get("kind") or ""),
+            value=str(kwargs.get("value") or ""),
+            message=str(kwargs.get("message") or ""),
+            repeat=str(kwargs.get("repeat") or "once"),
+            count_raw=kwargs.get("count"),
+            label=str(kwargs.get("label") or ""),
+        )
+        if alarm is None:
+            return {"success": False, "error": error}
+        repeat_text = self._repeat_text(alarm)
+        when_text = alarm.next_fire_at.astimezone(self._tz).strftime("%m-%d %H:%M")
+        title = self._title_of(alarm)
+        logger.info("已设置闹钟: id=%s stream_id=%s kind=%s", alarm.id, alarm.stream_id, alarm.kind)
+        return {
+            "success": True,
+            "content": f"已设置闹钟 {alarm.id}：{when_text} 提醒「{title}」，{repeat_text}",
+            "alarm_id": alarm.id,
+            "next_fire_at": alarm.next_fire_at.isoformat(),
+        }
+
+    async def _create_alarm(
+        self,
+        *,
+        stream_id: str,
+        platform: str,
+        kind: str,
+        value: str,
+        message: str,
+        repeat: str,
+        count_raw: Any,
+        label: str,
+    ) -> tuple[Alarm | None, str]:
+        """校验参数并创建闹钟，返回 (闹钟, 错误信息)；工具与 WebUI 共用。"""
+        stream_id = stream_id.strip()
+        platform = platform.strip()
+        kind = kind.strip().lower()
+        value = value.strip()
+        message = message.strip()
+        repeat = repeat.strip().lower()
+        label = label.strip()[:64]
 
         if not stream_id:
-            return {"success": False, "error": "无法确定当前聊天流，闹钟未设置"}
+            return None, "无法确定当前聊天流，闹钟未设置"
         if kind not in _KINDS:
-            return {"success": False, "error": f"kind 只能是 {'/'.join(_KINDS)}"}
+            return None, f"kind 只能是 {'/'.join(_KINDS)}"
         if repeat not in _REPEATS:
-            return {"success": False, "error": f"repeat 只能是 {'/'.join(_REPEATS)}"}
+            return None, f"repeat 只能是 {'/'.join(_REPEATS)}"
         if not message:
-            return {"success": False, "error": "message 不能为空"}
+            return None, "message 不能为空"
         if len(message) > self.config.max_message_length:
-            return {"success": False, "error": f"message 超过 {self.config.max_message_length} 字上限"}
+            return None, f"message 超过 {self.config.max_message_length} 字上限"
         if kind == "at" and repeat != "once":
-            return {"success": False, "error": "at 类型只能响一次，不能配 count 或 forever"}
+            return None, "at 类型只能响一次，不能配 count 或 forever"
         if not value:
-            return {"success": False, "error": "value 不能为空"}
+            return None, "value 不能为空"
 
         repeat_total: int | None = None
         if repeat == "count":
-            count_raw = kwargs.get("count")
             if count_raw is None or str(count_raw).strip() == "":
-                return {"success": False, "error": "repeat=count 时必须提供整数 count"}
+                return None, "repeat=count 时必须提供整数 count"
             try:
                 repeat_total = int(count_raw)
             except (TypeError, ValueError):
-                return {"success": False, "error": "count 必须是整数"}
+                return None, "count 必须是整数"
             if not 1 <= repeat_total <= self.config.max_repeat_count:
-                return {"success": False, "error": f"count 必须在 1 到 {self.config.max_repeat_count} 之间"}
+                return None, f"count 必须在 1 到 {self.config.max_repeat_count} 之间"
 
         now = datetime.now(self._tz)
         delay_seconds: int | None = None
@@ -717,30 +755,30 @@ class ClockPlugin(MaiBotPlugin):
             if kind == "delay":
                 delay_seconds = parse_delay(value)
                 if delay_seconds < self.config.min_delay_seconds:
-                    return {"success": False, "error": f"延时不能小于 {self.config.min_delay_seconds} 秒"}
+                    return None, f"延时不能小于 {self.config.min_delay_seconds} 秒"
                 if delay_seconds > self.config.max_delay_seconds:
-                    return {"success": False, "error": f"延时不能大于 {self.config.max_delay_seconds} 秒"}
+                    return None, f"延时不能大于 {self.config.max_delay_seconds} 秒"
                 next_fire_at = now + timedelta(seconds=delay_seconds)
             elif kind == "at":
                 next_fire_at = parse_at(value, self._tz)
                 if next_fire_at <= now:
-                    return {"success": False, "error": "at 必须是未来时间"}
+                    return None, "at 必须是未来时间"
             else:
                 spec = parse_cron(value)
                 resolved = spec.next_after(now)
                 if resolved is None:
-                    return {"success": False, "error": "cron 表达式在一年内没有匹配时间"}
+                    return None, "cron 表达式在一年内没有匹配时间"
                 self._cron_cache[value] = spec
                 next_fire_at = resolved
         except ValueError as exc:
-            return {"success": False, "error": f"时间格式有误：{exc}"}
+            return None, f"时间格式有误：{exc}"
 
         async with self._lock:
             active = [alarm for alarm in self._alarms.values() if alarm.status == "active"]
             if sum(1 for alarm in active if alarm.stream_id == stream_id) >= self.config.max_alarms_per_stream:
-                return {"success": False, "error": f"当前聊天活跃闹钟已达上限 {self.config.max_alarms_per_stream}"}
+                return None, f"当前聊天活跃闹钟已达上限 {self.config.max_alarms_per_stream}"
             if len(active) >= self.config.max_alarms_total:
-                return {"success": False, "error": f"插件活跃闹钟总数已达上限 {self.config.max_alarms_total}"}
+                return None, f"插件活跃闹钟总数已达上限 {self.config.max_alarms_total}"
             alarm_id = uuid.uuid4().hex[:8]
             while alarm_id in self._alarms:
                 alarm_id = uuid.uuid4().hex[:8]
@@ -767,17 +805,23 @@ class ClockPlugin(MaiBotPlugin):
             self._alarms[alarm_id] = alarm
             self._push(alarm)
             await self._persist()
+        return alarm, ""
 
-        repeat_text = {"once": "仅一次", "forever": "每次", "count": f"共 {repeat_total} 次"}[repeat]
-        when_text = next_fire_at.astimezone(self._tz).strftime("%m-%d %H:%M")
-        title = label or (message[:20] + ("…" if len(message) > 20 else ""))
-        logger.info("已设置闹钟: id=%s stream_id=%s kind=%s", alarm_id, stream_id, kind)
-        return {
-            "success": True,
-            "content": f"已设置闹钟 {alarm_id}：{when_text} 提醒「{title}」，{repeat_text}",
-            "alarm_id": alarm_id,
-            "next_fire_at": next_fire_at.isoformat(),
-        }
+    @staticmethod
+    def _title_of(alarm: Alarm, limit: int = 20) -> str:
+        """闹钟的展示标题：优先 label，否则截断提醒文案。"""
+        if alarm.label:
+            return alarm.label
+        return alarm.message[:limit] + ("…" if len(alarm.message) > limit else "")
+
+    @staticmethod
+    def _repeat_text(alarm: Alarm) -> str:
+        """把重复策略转成中文描述。"""
+        if alarm.repeat == "forever":
+            return "每次"
+        if alarm.repeat == "count":
+            return f"共 {alarm.repeat_total} 次"
+        return "仅一次"
 
     @Tool(
         "clock_list",
@@ -843,6 +887,150 @@ class ClockPlugin(MaiBotPlugin):
             await self._persist()
         logger.info("已取消闹钟: id=%s stream_id=%s", alarm_id, stream_id)
         return {"success": True, "content": f"已取消闹钟 {alarm_id}"}
+
+    # ===== WebUI =====
+
+    @API("clock_alarms", description="列出所有聊天流的闹钟与可用聊天流", version="1")
+    async def clock_webui_alarms(self) -> dict[str, Any]:
+        """WebUI 查询：返回全部闹钟与聊天流展示名。"""
+        streams, stream_error = await self._stream_index()
+        now = datetime.now(self._tz)
+        alarms = sorted(
+            self._alarms.values(),
+            key=lambda alarm: (alarm.status != "active", alarm.next_fire_at),
+        )
+        return {
+            "success": True,
+            "ok": True,
+            "now": now.isoformat(),
+            "timezone": self.config.timezone,
+            "stream_error": stream_error,
+            "streams": sorted(streams.values(), key=lambda info: info["name"]),
+            "alarms": [self._alarm_view(alarm, streams) for alarm in alarms],
+        }
+
+    @API("clock_create", description="从 WebUI 创建闹钟", version="1")
+    async def clock_webui_create(
+        self,
+        stream_id: str,
+        kind: str,
+        value: str,
+        message: str,
+        repeat: str = "once",
+        count: int | None = None,
+        label: str = "",
+    ) -> dict[str, Any]:
+        """WebUI 操作：在指定聊天流创建闹钟。"""
+        streams, stream_error = await self._stream_index()
+        stream_id = str(stream_id or "").strip()
+        info = streams.get(stream_id)
+        if info is None:
+            return {"success": True, "ok": False, "error": stream_error or "目标聊天流不存在，请刷新后重试"}
+        alarm, error = await self._create_alarm(
+            stream_id=stream_id,
+            platform=info["platform"],
+            kind=str(kind or ""),
+            value=str(value or ""),
+            message=str(message or ""),
+            repeat=str(repeat or "once"),
+            count_raw=count,
+            label=str(label or ""),
+        )
+        if alarm is None:
+            return {"success": True, "ok": False, "error": error}
+        when_text = alarm.next_fire_at.astimezone(self._tz).strftime("%m-%d %H:%M")
+        self.ctx.logger.info("WebUI 创建闹钟: id=%s stream_id=%s", alarm.id, alarm.stream_id)
+        return {
+            "success": True,
+            "ok": True,
+            "content": f"已创建闹钟 {alarm.id}：{when_text} 提醒「{self._title_of(alarm)}」",
+            "alarm": self._alarm_view(alarm, streams),
+        }
+
+    @API("clock_cancel", description="从 WebUI 取消任意闹钟", version="1")
+    async def clock_webui_cancel(self, alarm_id: str) -> dict[str, Any]:
+        """WebUI 操作：取消指定闹钟，不限于当前聊天。"""
+        alarm_id = str(alarm_id or "").strip()
+        if not alarm_id:
+            return {"success": True, "ok": False, "error": "alarm_id 不能为空"}
+        async with self._lock:
+            alarm = self._alarms.pop(alarm_id, None)
+            if alarm is None:
+                return {"success": True, "ok": False, "error": f"没有 id 为 {alarm_id} 的闹钟"}
+            self._retries.pop(alarm_id, None)
+            await self._persist()
+        logger.info("WebUI 取消闹钟: id=%s stream_id=%s", alarm_id, alarm.stream_id)
+        return {"success": True, "ok": True, "content": f"已取消闹钟 {alarm_id}"}
+
+    async def _stream_index(self) -> tuple[dict[str, dict[str, str]], str]:
+        """从宿主读取全部聊天流，构建 stream_id -> 展示信息。"""
+        try:
+            result = await self.ctx.chat.get_all_streams(platform="all_platforms")
+        except Exception as exc:
+            self.ctx.logger.warning("读取聊天流失败: %s", exc)
+            return {}, f"读取聊天流失败：{exc}"
+        # 能力成功时 SDK 会直接返回 streams 列表；失败时仍是 {success: False, error} 字典。
+        if isinstance(result, dict):
+            error = str(result.get("error") or "")
+            self.ctx.logger.warning("读取聊天流返回异常: %s", error or "未知错误")
+            return {}, error or "读取聊天流失败"
+        if not isinstance(result, list):
+            return {}, "读取聊天流失败"
+        index: dict[str, dict[str, str]] = {}
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            stream_id = str(item.get("session_id") or item.get("stream_id") or "").strip()
+            if not stream_id:
+                continue
+            index[stream_id] = {
+                "stream_id": stream_id,
+                "name": self._stream_name(item),
+                "platform": str(item.get("platform") or ""),
+                "chat_type": str(item.get("chat_type") or ""),
+            }
+        return index, ""
+
+    @staticmethod
+    def _stream_name(stream: dict[str, Any]) -> str:
+        """按群名或「昵称的私聊」生成聊天流展示名。"""
+        if stream.get("is_group_session"):
+            name = str(stream.get("group_name") or "").strip()
+            if name:
+                return name
+            group_id = str(stream.get("group_id") or "").strip()
+            return f"群 {group_id}" if group_id else "群聊"
+        name = str(stream.get("user_cardname") or stream.get("user_nickname") or "").strip()
+        if name:
+            return f"{name}的私聊"
+        user_id = str(stream.get("user_id") or "").strip()
+        return f"私聊 {user_id}" if user_id else "私聊"
+
+    def _alarm_view(self, alarm: Alarm, streams: dict[str, dict[str, str]]) -> dict[str, Any]:
+        """把闹钟转成 WebUI 可直接渲染的字典。"""
+        info = streams.get(alarm.stream_id)
+        return {
+            "id": alarm.id,
+            "stream_id": alarm.stream_id,
+            "stream_name": info["name"] if info else f"未知聊天 {alarm.stream_id[:8]}",
+            "platform": alarm.platform,
+            "kind": alarm.kind,
+            "value": alarm.value,
+            "repeat": alarm.repeat,
+            "repeat_total": alarm.repeat_total,
+            "fired_count": alarm.fired_count,
+            "remaining": alarm.remaining(),
+            "next_fire_at": alarm.next_fire_at.astimezone(self._tz).isoformat(),
+            "next_fire_text": alarm.next_fire_at.astimezone(self._tz).strftime("%m-%d %H:%M"),
+            "created_at": alarm.created_at.astimezone(self._tz).isoformat(),
+            "last_fire_at": alarm.last_fire_at.astimezone(self._tz).isoformat() if alarm.last_fire_at else "",
+            "last_error": alarm.last_error,
+            "status": alarm.status,
+            "label": alarm.label,
+            "title": self._title_of(alarm),
+            # 列表可能有数百条，宿主的 WebUI 响应上限是 512 KiB，这里只回传摘要。
+            "message": alarm.message[:200] + ("…" if len(alarm.message) > 200 else ""),
+        }
 
 
 def create_plugin() -> MaiBotPlugin:

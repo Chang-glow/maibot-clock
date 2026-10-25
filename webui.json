@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["custom_pages"],
+  "pages": [
+    {
+      "id": "alarms",
+      "title": "闹钟",
+      "description": "查看、创建、取消麦麦的闹钟",
+      "placement": "sidebar",
+      "icon": "list",
+      "mode": "custom",
+      "entry": "webui/alarms.html",
+      "queries": {
+        "alarms": {
+          "api": "clock_alarms",
+          "version": "1"
+        }
+      },
+      "actions": {
+        "create": {
+          "api": "clock_create",
+          "version": "1",
+          "parameters": {
+            "stream_id": { "type": "string", "required": true, "max_length": 200 },
+            "kind": { "type": "string", "required": true, "choices": ["delay", "at", "cron"] },
+            "value": { "type": "string", "required": true, "max_length": 200 },
+            "message": { "type": "string", "required": true, "max_length": 4000 },
+            "repeat": { "type": "string", "required": true, "choices": ["once", "count", "forever"] },
+            "count": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "label": { "type": "string", "max_length": 80 }
+          }
+        },
+        "cancel": {
+          "api": "clock_cancel",
+          "version": "1",
+          "parameters": {
+            "alarm_id": { "type": "string", "required": true, "max_length": 32 }
+          },
+          "confirmation": "取消后这个闹钟不会再触发，确定取消吗？"
+        }
+      }
+    }
+  ]
+}
