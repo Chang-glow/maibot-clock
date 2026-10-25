@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "local.maibot-clock",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "name": "MaiBot Clock | 麦麦闹钟",
-  "description": "让模型给自己定闹钟：延时、固定时间、cron，支持一次/多次/每次，到点原样发送提醒文案。",
+  "description": "让模型给自己定闹钟：延时、固定时间、cron，支持一次/多次/每次，到点交给 Planner 自行处理。",
   "author": {
     "name": "local",
     "url": "https://github.com/"
@@ -22,7 +22,7 @@
   },
   "dependencies": [],
   "capabilities": [
-    "send.text"
+    "maisaka.proactive.trigger"
   ],
   "i18n": {
     "default_locale": "zh-CN"

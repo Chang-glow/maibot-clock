@@ -4,8 +4,8 @@
 支持一次、限定次数、每次重复）、``clock_list``（查看当前聊天流的闹钟）、
 ``clock_cancel``（按 id 取消）。
 
-到点后插件直接把设置时写好的文案发送到创建闹钟的聊天流，不唤醒 Planner，
-也不重新组织语言。
+到点后插件把设置时写好的文案作为主动任务意图交给 Planner，由模型自己看到
+这条提醒并决定要不要回复、怎么回复，插件不直接向聊天发送消息。
 """
 
 from __future__ import annotations
@@ -59,8 +59,8 @@ class ClockConfig(PluginConfigBase):
     max_message_length: int = Field(default=1000, ge=1, description="提醒文案最大长度")
     max_repeat_count: int = Field(default=100, ge=1, description="repeat=count 时的最大次数")
     misfire_grace_seconds: int = Field(default=300, ge=0, description="重启后错过多久内的闹钟仍然补发")
-    send_retry_attempts: int = Field(default=2, ge=0, description="发送失败后的重试次数")
-    send_retry_backoff_seconds: int = Field(default=30, ge=1, description="发送失败重试的间隔（秒）")
+    send_retry_attempts: int = Field(default=2, ge=0, description="交给 Planner 失败后的重试次数")
+    send_retry_backoff_seconds: int = Field(default=30, ge=1, description="交给 Planner 失败后重试的间隔（秒）")
 
 
 @dataclass
@@ -393,8 +393,8 @@ class ClockPlugin(MaiBotPlugin):
     # ===== 触发与推进 =====
 
     async def _fire(self, alarm: Alarm) -> None:
-        """发送闹钟文案，并按结果推进或标记失败。"""
-        sent, error = await self._send(alarm)
+        """把闹钟交给 Planner，并按结果推进或标记失败。"""
+        sent, error = await self._trigger(alarm)
         async with self._lock:
             current = self._alarms.get(alarm.id)
             if current is None or current.generation != alarm.generation:
@@ -411,11 +411,11 @@ class ClockPlugin(MaiBotPlugin):
                     current.next_fire_at = self._advance(current, now)
                     self._push(current)
             else:
-                await self._handle_send_failure(current, error, now)
+                await self._handle_trigger_failure(current, error, now)
             await self._persist()
 
-    async def _handle_send_failure(self, alarm: Alarm, error: str, now: datetime) -> None:
-        """发送失败后的重试与放弃策略。"""
+    async def _handle_trigger_failure(self, alarm: Alarm, error: str, now: datetime) -> None:
+        """触发失败后的重试与放弃策略。"""
         attempts = self._retries.get(alarm.id, 0) + 1
         alarm.last_error = error
         if attempts <= self.config.send_retry_attempts:
@@ -435,7 +435,7 @@ class ClockPlugin(MaiBotPlugin):
             alarm.next_fire_at = self._advance(alarm, now)
         except ValueError as exc:
             alarm.status = "failed"
-            alarm.last_error = f"发送失败且无法推进：{exc}"
+            alarm.last_error = f"触发失败且无法推进：{exc}"
             return
         self._push(alarm)
 
@@ -463,16 +463,23 @@ class ClockPlugin(MaiBotPlugin):
             self._cron_cache[expression] = spec
         return spec
 
-    async def _send(self, alarm: Alarm) -> tuple[bool, str]:
-        """发送提醒文案，返回 (是否成功, 错误信息)。"""
+    async def _trigger(self, alarm: Alarm) -> tuple[bool, str]:
+        """把闹钟作为主动任务交给 Planner，返回 (是否入队成功, 错误信息)。"""
         try:
-            result = await self.ctx.send.text(alarm.message, alarm.stream_id)
+            result = await self.ctx.maisaka.proactive.trigger(
+                stream_id=alarm.stream_id,
+                intent=alarm.message,
+                reason="闹钟到期",
+                metadata={"alarm_id": alarm.id, "label": alarm.label, "kind": alarm.kind},
+            )
         except Exception as exc:
-            logger.exception("闹钟发送异常: id=%s stream_id=%s", alarm.id, alarm.stream_id)
-            return False, f"发送异常：{exc}"
+            logger.exception("闹钟触发异常: id=%s stream_id=%s", alarm.id, alarm.stream_id)
+            return False, f"触发异常：{exc}"
         if isinstance(result, dict):
-            return bool(result.get("sent")), "" if result.get("sent") else "发送接口返回未送达"
-        return bool(result), "" if result else "发送接口返回未送达"
+            if result.get("success"):
+                return True, ""
+            return False, str(result.get("error") or "主动任务入队失败")
+        return bool(result), "" if result else "主动任务入队失败"
 
     # ===== 持久化 =====
 
@@ -576,13 +583,14 @@ class ClockPlugin(MaiBotPlugin):
     @Tool(
         "clock_set",
         description=(
-            "给自己设置一个闹钟，到点后把 message 原样发送到当前聊天。"
+            "给自己设置一个闹钟。到点后插件会把 message 作为主动任务交给 Planner（也就是你自己），"
+            "你届时会看到这条提醒，并自行决定要不要回复、怎么回复。"
             "kind 三种取值：delay=延时（value 如 10m、1h30m、90），"
             "at=固定时间（value 为 ISO-8601，如 2026-10-26 08:00，无时区按插件配置时区解释），"
             "cron=按 cron 表达式重复（value 为 5 字段，如 0 9 * * 1-5）。"
             "repeat：once 只响一次；count 响 count 次（仅 delay/cron）；forever 一直重复（仅 delay/cron）。"
             "delay 配 count/forever 时按同样的延时做固定间隔重复；at 只能 once。"
-            "message 是到点后原样发送的文案，现在就要写好，不会到点再生成。"
+            "message 是到点后交给你的提醒内容，现在就要写好，不会到点再生成。"
             "成功返回 alarm_id，可用于 clock_cancel。"
         ),
         parameters=[
@@ -602,7 +610,7 @@ class ClockPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="message",
                 param_type=ToolParamType.STRING,
-                description="到点后原样发送的提醒文案，现在就写好",
+                description="到点后交给 Planner 的提醒内容，写清楚要提醒什么，现在就写好",
                 required=True,
             ),
             ToolParameterInfo(
@@ -736,7 +744,7 @@ class ClockPlugin(MaiBotPlugin):
     @Tool(
         "clock_list",
         description=(
-            "列出当前聊天里由本插件设置、尚未结束的闹钟（包括上次发送失败而停下的）。"
+            "列出当前聊天里由本插件设置、尚未结束的闹钟（包括上次触发失败而停下的）。"
             "返回每条闹钟的 id、下次触发时间、剩余次数、状态和提醒文案摘要。"
             "用户问起有哪些闹钟、或者你需要确认后再设置时使用。"
         ),
