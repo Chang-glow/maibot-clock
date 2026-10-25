@@ -1,0 +1,16 @@
+# 运行时产物
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 由宿主根据 config_model 生成
+config.toml
+
+# 隐藏文件默认忽略
+.*
+!.gitignore
+!.gitattributes
