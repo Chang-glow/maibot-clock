@@ -5,7 +5,7 @@
     {
       "id": "alarms",
       "title": "闹钟",
-      "description": "查看、创建、取消麦麦的闹钟",
+      "description": "查看、创建、修改、取消麦麦的闹钟",
       "placement": "sidebar",
       "icon": "list",
       "mode": "custom",
@@ -26,6 +26,20 @@
             "value": { "type": "string", "required": true, "max_length": 200 },
             "message": { "type": "string", "required": true, "max_length": 4000 },
             "repeat": { "type": "string", "required": true, "choices": ["once", "count", "forever"] },
+            "count": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "label": { "type": "string", "max_length": 80 },
+            "alarm_id": { "type": "string", "max_length": 32 }
+          }
+        },
+        "rewrite": {
+          "api": "clock_rewrite",
+          "version": "1",
+          "parameters": {
+            "alarm_id": { "type": "string", "required": true, "max_length": 32 },
+            "message": { "type": "string", "max_length": 4000 },
+            "kind": { "type": "string", "choices": ["delay", "at", "cron"] },
+            "value": { "type": "string", "max_length": 200 },
+            "repeat": { "type": "string", "choices": ["once", "count", "forever"] },
             "count": { "type": "integer", "minimum": 1, "maximum": 100 },
             "label": { "type": "string", "max_length": 80 }
           }

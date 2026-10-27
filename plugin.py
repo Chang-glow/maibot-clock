@@ -33,11 +33,13 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STORE_FILENAME = "alarms.json"
 
 _KINDS = ("delay", "at", "cron")
 _REPEATS = ("once", "count", "forever")
+_ID_MAX_LENGTH = 32
+_NUMERIC_ID = re.compile(r"\d+")
 _DELAY_PATTERN = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
 _CRON_FIELD_LIMITS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
 
@@ -119,7 +121,8 @@ class Alarm:
         created_at = datetime.fromisoformat(str(raw["created_at"]))
         last_fire_raw = raw.get("last_fire_at")
         return cls(
-            id=str(raw["id"]),
+            # 旧版没有可读编号，留空后由载入逻辑按顺序补齐。
+            id=str(raw.get("id") or ""),
             stream_id=str(raw["stream_id"]),
             platform=str(raw.get("platform") or ""),
             kind=str(raw["kind"]),
@@ -567,8 +570,9 @@ class ClockPlugin(MaiBotPlugin):
         if not isinstance(items, list):
             self.ctx.logger.warning("闹钟存储缺少 alarms 数组；按空表启动")
             return
+        legacy_schema = int(raw.get("schema_version") or 1) < SCHEMA_VERSION
         now = datetime.now(self._tz)
-        changed = False
+        changed = legacy_schema
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -578,6 +582,9 @@ class ClockPlugin(MaiBotPlugin):
                 logger.warning("跳过损坏的闹钟记录: %s", exc)
                 changed = True
                 continue
+            if legacy_schema:
+                # 旧版 id 是随机串，升级后按文件顺序重排成可读的数字编号
+                alarm.id = ""
             if alarm.status == "active" and alarm.next_fire_at.tzinfo is None:
                 alarm.next_fire_at = alarm.next_fire_at.replace(tzinfo=self._tz)
                 changed = True
@@ -597,11 +604,9 @@ class ClockPlugin(MaiBotPlugin):
                     alarm.status = "failed"
                     alarm.last_error = "离线错过触发时间，已超过补发宽限"
                     changed = True
-            if alarm.id in self._alarms:
-                alarm.id = uuid.uuid4().hex[:8]
+            if not alarm.id or alarm.id in self._alarms:
+                alarm.id = self._next_alarm_id()
                 changed = True
-                while alarm.id in self._alarms:
-                    alarm.id = uuid.uuid4().hex[:8]
             self._alarms[alarm.id] = alarm
         self._rebuild_heap()
         if changed:
@@ -674,6 +679,12 @@ class ClockPlugin(MaiBotPlugin):
                 description="可选短标题，便于 clock_list 展示",
                 required=False,
             ),
+            ToolParameterInfo(
+                name="id",
+                param_type=ToolParamType.STRING,
+                description="可选的自定义编号。留空则顺延下一个数字编号；填写的编号重复会报错",
+                required=False,
+            ),
         ],
         visibility="visible",
     )
@@ -688,6 +699,7 @@ class ClockPlugin(MaiBotPlugin):
             repeat=str(kwargs.get("repeat") or "once"),
             count_raw=kwargs.get("count"),
             label=str(kwargs.get("label") or ""),
+            alarm_id_raw=str(kwargs.get("id") or ""),
         )
         if alarm is None:
             return {"success": False, "error": error}
@@ -713,6 +725,7 @@ class ClockPlugin(MaiBotPlugin):
         repeat: str,
         count_raw: Any,
         label: str,
+        alarm_id_raw: str = "",
     ) -> tuple[Alarm | None, str]:
         """校验参数并创建闹钟，返回 (闹钟, 错误信息)；工具与 WebUI 共用。"""
         stream_id = stream_id.strip()
@@ -722,6 +735,9 @@ class ClockPlugin(MaiBotPlugin):
         message = message.strip()
         repeat = repeat.strip().lower()
         label = label.strip()[:64]
+        custom_id, id_error = self._normalize_alarm_id(alarm_id_raw)
+        if id_error:
+            return None, id_error
 
         if not stream_id:
             return None, "无法确定当前聊天流，闹钟未设置"
@@ -779,9 +795,12 @@ class ClockPlugin(MaiBotPlugin):
                 return None, f"当前聊天活跃闹钟已达上限 {self.config.max_alarms_per_stream}"
             if len(active) >= self.config.max_alarms_total:
                 return None, f"插件活跃闹钟总数已达上限 {self.config.max_alarms_total}"
-            alarm_id = uuid.uuid4().hex[:8]
-            while alarm_id in self._alarms:
-                alarm_id = uuid.uuid4().hex[:8]
+            if custom_id:
+                if custom_id in self._alarms:
+                    return None, f"id「{custom_id}」已被占用，请换一个或留空自动编号"
+                alarm_id = custom_id
+            else:
+                alarm_id = self._next_alarm_id()
             alarm = Alarm(
                 id=alarm_id,
                 stream_id=stream_id,
@@ -822,6 +841,236 @@ class ClockPlugin(MaiBotPlugin):
         if alarm.repeat == "count":
             return f"共 {alarm.repeat_total} 次"
         return "仅一次"
+
+    @staticmethod
+    def _normalize_alarm_id(raw: str) -> tuple[str, str]:
+        """校验自定义 id，返回 (id, 错误信息)；空字符串表示自动编号。"""
+        value = raw.strip()
+        if not value:
+            return "", ""
+        if len(value) > _ID_MAX_LENGTH:
+            return "", f"id 不能超过 {_ID_MAX_LENGTH} 个字符"
+        if any(ch.isspace() or ord(ch) < 32 for ch in value):
+            return "", "id 不能包含空白或控制字符"
+        return value, ""
+
+    def _next_alarm_id(self) -> str:
+        """顺延编号：现有纯数字 id 的最大值 + 1。"""
+        numbers = [int(alarm.id) for alarm in self._alarms.values() if _NUMERIC_ID.fullmatch(alarm.id)]
+        return str(max(numbers, default=0) + 1)
+
+    @Tool(
+        "clock_rewrite",
+        description=(
+            "按 id 修改当前聊天里已有的闹钟：可以改提醒内容、时间/间隔、重复方式、次数或备注。"
+            "只传需要修改的参数；修改 kind 时必须同时提供 value。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="alarm_id",
+                param_type=ToolParamType.STRING,
+                description="要修改的闹钟 id（clock_list / clock_set 返回的编号）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="message",
+                param_type=ToolParamType.STRING,
+                description="新的提醒内容",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="kind",
+                param_type=ToolParamType.STRING,
+                enum_values=list(_KINDS),
+                description="新的闹钟类型；修改时必须同时提供 value",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="value",
+                param_type=ToolParamType.STRING,
+                description="新的时间或间隔，格式与 clock_set 相同；只给 value 时沿用原类型",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="repeat",
+                param_type=ToolParamType.STRING,
+                enum_values=list(_REPEATS),
+                description="新的重复方式",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="count",
+                param_type=ToolParamType.INTEGER,
+                description="repeat=count 时的总次数，必须大于已触发次数",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="label",
+                param_type=ToolParamType.STRING,
+                description="新的短标题",
+                required=False,
+            ),
+        ],
+        visibility="visible",
+    )
+    async def clock_rewrite(self, **kwargs: Any) -> dict[str, Any]:
+        """LLM 工具：修改闹钟。"""
+        stream_id = str(kwargs.get("stream_id") or "").strip()
+        alarm_id = str(kwargs.get("alarm_id") or "").strip()
+        if not stream_id:
+            return {"success": False, "error": "无法确定当前聊天流"}
+        if not alarm_id:
+            return {"success": False, "error": "alarm_id 不能为空"}
+        changes = self._collect_changes(kwargs)
+        if "kind" in changes and "value" not in changes:
+            return {"success": False, "error": "修改 kind 时必须同时提供 value"}
+        if not changes and self._no_count(kwargs.get("count")):
+            return {"success": False, "error": "没有要修改的内容，至少提供 message、kind+value、repeat、count、label 之一"}
+        alarm, error = await self._rewrite_alarm(alarm_id, changes, kwargs.get("count"), stream_id=stream_id)
+        if alarm is None:
+            return {"success": False, "error": error}
+        logger.info("已修改闹钟: id=%s stream_id=%s", alarm.id, alarm.stream_id)
+        when_text = alarm.next_fire_at.astimezone(self._tz).strftime("%m-%d %H:%M")
+        return {
+            "success": True,
+            "content": (
+                f"已修改闹钟 {alarm.id}：{when_text} 提醒「{self._title_of(alarm)}」，"
+                f"{self._repeat_text(alarm)}"
+            ),
+            "alarm_id": alarm.id,
+            "next_fire_at": alarm.next_fire_at.isoformat(),
+        }
+
+    @staticmethod
+    def _collect_changes(kwargs: dict[str, Any]) -> dict[str, str]:
+        """从调用参数里取出非空的修改项，kind / repeat 统一小写。"""
+        changes: dict[str, str] = {}
+        for key in ("message", "kind", "value", "repeat", "label"):
+            raw = kwargs.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                continue
+            changes[key] = text.lower() if key in {"kind", "repeat"} else text
+        return changes
+
+    @staticmethod
+    def _no_count(count_raw: Any) -> bool:
+        """判断 count 是否未提供。"""
+        return count_raw is None or str(count_raw).strip() == ""
+
+    async def _rewrite_alarm(
+        self,
+        alarm_id: str,
+        changes: dict[str, str],
+        count_raw: Any,
+        *,
+        stream_id: str | None = None,
+    ) -> tuple[Alarm | None, str]:
+        """按 id 修改闹钟；给了 stream_id 时只允许改本聊天的闹钟。"""
+        async with self._lock:
+            alarm = self._alarms.get(alarm_id)
+            if alarm is None or (stream_id is not None and alarm.stream_id != stream_id):
+                if stream_id is not None:
+                    return None, f"当前聊天没有 id 为 {alarm_id} 的闹钟"
+                return None, f"没有 id 为 {alarm_id} 的闹钟"
+            error = self._apply_rewrite(alarm, changes, count_raw)
+            if error:
+                return None, error
+            self._retries.pop(alarm.id, None)
+            # 换代让堆里的旧触发项失效，改完的闹钟才不会被旧计划覆盖。
+            alarm.generation += 1
+            self._push(alarm)
+            await self._persist()
+            return alarm, ""
+
+    def _apply_rewrite(self, alarm: Alarm, changes: dict[str, str], count_raw: Any) -> str:
+        """校验并把修改写入闹钟，返回错误信息；空字符串表示成功。"""
+        kind = changes.get("kind")
+        value = changes.get("value")
+        repeat = changes.get("repeat")
+        message = changes.get("message")
+
+        if kind is not None and kind not in _KINDS:
+            return f"kind 只能是 {'/'.join(_KINDS)}"
+        if repeat is not None and repeat not in _REPEATS:
+            return f"repeat 只能是 {'/'.join(_REPEATS)}"
+
+        new_kind = kind or alarm.kind
+        new_value = value if value is not None else alarm.value
+        new_repeat = repeat or alarm.repeat
+        new_message = message if message is not None else alarm.message
+        if len(new_message) > self.config.max_message_length:
+            return f"message 超过 {self.config.max_message_length} 字上限"
+        if new_kind == "at" and new_repeat != "once":
+            return "at 类型只能响一次，不能配 count 或 forever"
+
+        has_count = not self._no_count(count_raw)
+        repeat_total = alarm.repeat_total
+        if new_repeat == "count":
+            if has_count:
+                try:
+                    repeat_total = int(count_raw)
+                except (TypeError, ValueError):
+                    return "count 必须是整数"
+            elif repeat_total is None:
+                return "repeat=count 时必须提供整数 count"
+            if not 1 <= repeat_total <= self.config.max_repeat_count:
+                return f"count 必须在 1 到 {self.config.max_repeat_count} 之间"
+            if repeat_total <= alarm.fired_count:
+                return f"这个闹钟已触发 {alarm.fired_count} 次，总次数必须大于已触发次数"
+        else:
+            if has_count:
+                return "只有 repeat=count 时才能设置 count"
+            if repeat is not None and new_repeat == "once" and alarm.fired_count >= 1:
+                return f"这个闹钟已触发 {alarm.fired_count} 次，不能再改成仅一次"
+            repeat_total = None
+
+        now = datetime.now(self._tz)
+        schedule_changed = kind is not None or value is not None
+        delay_seconds = alarm.delay_seconds
+        next_fire_at = alarm.next_fire_at
+        if schedule_changed:
+            try:
+                if new_kind == "delay":
+                    delay_seconds = parse_delay(new_value)
+                    if delay_seconds < self.config.min_delay_seconds:
+                        return f"延时不能小于 {self.config.min_delay_seconds} 秒"
+                    if delay_seconds > self.config.max_delay_seconds:
+                        return f"延时不能大于 {self.config.max_delay_seconds} 秒"
+                    next_fire_at = now + timedelta(seconds=delay_seconds)
+                elif new_kind == "at":
+                    delay_seconds = None
+                    next_fire_at = parse_at(new_value, self._tz)
+                    if next_fire_at <= now:
+                        return "at 必须是未来时间"
+                else:
+                    delay_seconds = None
+                    spec = parse_cron(new_value)
+                    resolved = spec.next_after(now)
+                    if resolved is None:
+                        return "cron 表达式在一年内没有匹配时间"
+                    self._cron_cache[new_value] = spec
+                    next_fire_at = resolved
+            except ValueError as exc:
+                return f"时间格式有误：{exc}"
+
+        alarm.message = new_message
+        alarm.kind = new_kind
+        alarm.value = new_value
+        alarm.delay_seconds = delay_seconds
+        alarm.repeat = new_repeat
+        alarm.repeat_total = repeat_total
+        alarm.next_fire_at = next_fire_at
+        if "label" in changes:
+            alarm.label = changes["label"][:64]
+        # 换了时间就重新生效：改时间通常就是为了救回已失败的闹钟。
+        if schedule_changed:
+            alarm.status = "active"
+        if alarm.status == "active":
+            alarm.last_error = ""
+        return ""
 
     @Tool(
         "clock_list",
@@ -919,6 +1168,7 @@ class ClockPlugin(MaiBotPlugin):
         repeat: str = "once",
         count: int | None = None,
         label: str = "",
+        alarm_id: str = "",
     ) -> dict[str, Any]:
         """WebUI 操作：在指定聊天流创建闹钟。"""
         streams, stream_error = await self._stream_index()
@@ -935,6 +1185,7 @@ class ClockPlugin(MaiBotPlugin):
             repeat=str(repeat or "once"),
             count_raw=count,
             label=str(label or ""),
+            alarm_id_raw=str(alarm_id or ""),
         )
         if alarm is None:
             return {"success": True, "ok": False, "error": error}
@@ -945,6 +1196,46 @@ class ClockPlugin(MaiBotPlugin):
             "ok": True,
             "content": f"已创建闹钟 {alarm.id}：{when_text} 提醒「{self._title_of(alarm)}」",
             "alarm": self._alarm_view(alarm, streams),
+        }
+
+    @API("clock_rewrite", description="从 WebUI 修改任意闹钟", version="1")
+    async def clock_webui_rewrite(
+        self,
+        alarm_id: str,
+        message: str | None = None,
+        kind: str | None = None,
+        value: str | None = None,
+        repeat: str | None = None,
+        count: int | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        """WebUI 操作：按 id 修改闹钟，不限于当前聊天。"""
+        alarm_id = str(alarm_id or "").strip()
+        if not alarm_id:
+            return {"success": True, "ok": False, "error": "alarm_id 不能为空"}
+        changes = self._collect_changes(
+            {
+                "message": message,
+                "kind": kind,
+                "value": value,
+                "repeat": repeat,
+                "label": label,
+            }
+        )
+        if "kind" in changes and "value" not in changes:
+            return {"success": True, "ok": False, "error": "修改类型时必须同时填写时间或间隔"}
+        if not changes and self._no_count(count):
+            return {"success": True, "ok": False, "error": "没有要修改的内容"}
+        alarm, error = await self._rewrite_alarm(alarm_id, changes, count)
+        if alarm is None:
+            return {"success": True, "ok": False, "error": error}
+        when_text = alarm.next_fire_at.astimezone(self._tz).strftime("%m-%d %H:%M")
+        self.ctx.logger.info("WebUI 修改闹钟: id=%s stream_id=%s", alarm.id, alarm.stream_id)
+        return {
+            "success": True,
+            "ok": True,
+            "content": f"已修改闹钟 {alarm.id}：{when_text} 提醒「{self._title_of(alarm)}」",
+            "alarm_id": alarm.id,
         }
 
     @API("clock_cancel", description="从 WebUI 取消任意闹钟", version="1")

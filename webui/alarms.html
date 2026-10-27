@@ -49,6 +49,7 @@ textarea.maibot-input{resize:vertical;min-height:72px}
 .alarm-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px}
 .alarm-foot .mono{color:var(--muted)}
 button.small{padding:4px 10px;font-size:12px}
+#cancel-edit{margin-top:8px}
 @media(max-width:900px){.split{grid-template-columns:1fr}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -77,12 +78,18 @@ button.small{padding:4px 10px;font-size:12px}
 
   <div class="split">
     <aside class="card maibot-card">
-      <div class="card-head"><div><h3>新建闹钟</h3><p>提醒内容会原样作为闹钟意图。</p></div></div>
+      <div class="card-head"><div><h3 id="form-title">新建闹钟</h3><p id="form-hint">提醒内容会原样作为闹钟意图。</p></div></div>
 
       <div class="field">
         <label for="stream">聊天流</label>
         <select class="maibot-select" id="stream"></select>
         <p class="hint" id="stream-hint" hidden></p>
+      </div>
+
+      <div class="field" id="id-field">
+        <label for="alarm-id">编号（可选）</label>
+        <input class="maibot-input" id="alarm-id" type="text" maxlength="32" autocomplete="off" spellcheck="false" placeholder="留空自动顺延">
+        <p class="hint">自定义编号必须唯一，重复会报错。</p>
       </div>
 
       <div class="field">
@@ -125,6 +132,7 @@ button.small{padding:4px 10px;font-size:12px}
       </div>
 
       <button class="maibot-button maibot-button-primary full" id="create">创建闹钟</button>
+      <button class="maibot-button full" id="cancel-edit" hidden>取消编辑</button>
     </aside>
 
     <section>
@@ -143,7 +151,7 @@ const KIND_HINTS = {
 };
 const KIND_PLACEHOLDER = { delay: '10m', at: '2026-10-26 08:00', cron: '0 9 * * 1-5' };
 const STATUS_TEXT = { active: '进行中', failed: '已停止' };
-const state = { streams: [], alarms: [], busy: false, loading: false, again: false, timer: null };
+const state = { streams: [], alarms: [], busy: false, loading: false, again: false, timer: null, editing: null, original: null };
 
 function notice(message, kind = '') {
   const node = $('notice');
@@ -182,14 +190,21 @@ function alarmCard(alarm) {
   title.append(el('strong', '', alarm.title || '未命名提醒'));
   title.append(el('span', `badge ${alarm.status === 'active' ? 'active' : 'failed'}`, STATUS_TEXT[alarm.status] || alarm.status));
   title.append(el('span', 'badge', alarm.stream_name || '未知聊天'));
+  if (state.editing === alarm.id) title.append(el('span', 'badge active', '编辑中'));
   head.append(title);
 
+  const actions = el('div', 'row');
+  const edit = el('button', 'maibot-button small', '修改');
+  edit.dataset.edit = alarm.id;
+  edit.disabled = state.busy;
+  actions.append(edit);
   if (alarm.status === 'active') {
     const cancel = el('button', 'maibot-button maibot-button-danger small', '取消');
     cancel.dataset.cancel = alarm.id;
     cancel.disabled = state.busy;
-    head.append(cancel);
+    actions.append(cancel);
   }
+  head.append(actions);
   card.append(head);
 
   const meta = el('div', 'alarm-meta');
@@ -252,11 +267,69 @@ function syncRepeat() {
   $('count-field').hidden = $('repeat').value !== 'count';
 }
 
+function startEdit(alarm) {
+  state.editing = alarm.id;
+  state.original = {
+    kind: alarm.kind,
+    value: alarm.value,
+    repeat: alarm.repeat,
+    count: alarm.repeat_total,
+    message: alarm.message,
+    label: alarm.label,
+  };
+  $('form-title').textContent = `修改闹钟 ${alarm.id}`;
+  $('form-hint').textContent = '只提交改动过的字段；修改时间会重新开始计时。';
+  $('stream').value = alarm.stream_id;
+  $('stream').disabled = true;
+  $('id-field').hidden = true;
+  $('kind').value = alarm.kind;
+  applyKind();
+  $('value').value = alarm.value;
+  $('repeat').value = alarm.repeat;
+  syncRepeat();
+  $('count').value = alarm.repeat_total ?? 3;
+  $('message').value = alarm.message;
+  $('label').value = alarm.label;
+  $('create').textContent = '保存修改';
+  $('cancel-edit').hidden = false;
+  notice(`正在修改闹钟 ${alarm.id}，点「保存修改」提交。`);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  $('message').focus();
+}
+
+function exitEdit() {
+  state.editing = null;
+  state.original = null;
+  $('form-title').textContent = '新建闹钟';
+  $('form-hint').textContent = '提醒内容会原样作为闹钟意图。';
+  $('stream').disabled = false;
+  $('id-field').hidden = false;
+  $('alarm-id').value = '';
+  $('kind').value = 'delay';
+  $('repeat').value = 'once';
+  applyKind();
+  $('value').value = '';
+  $('message').value = '';
+  $('label').value = '';
+  $('count').value = '3';
+  $('create').textContent = '创建闹钟';
+  $('cancel-edit').hidden = true;
+  notice('');
+}
+
+function startEditById(alarmId) {
+  if (state.busy) return;
+  const alarm = state.alarms.find(item => item.id === alarmId);
+  if (!alarm) { notice('闹钟已不存在，请刷新', 'error'); return; }
+  startEdit(alarm);
+}
+
 function setBusy(busy) {
   state.busy = busy;
   $('create').disabled = busy;
   $('refresh').disabled = busy;
-  for (const node of document.querySelectorAll('[data-cancel]')) node.disabled = busy;
+  $('cancel-edit').disabled = busy;
+  for (const node of document.querySelectorAll('[data-cancel], [data-edit]')) node.disabled = busy;
 }
 
 async function load(silent = false) {
@@ -293,10 +366,12 @@ async function createAlarm() {
   const message = $('message').value.trim();
   const repeat = $('repeat').value;
   const label = $('label').value.trim();
+  const alarm_id = $('alarm-id').value.trim();
   if (!stream_id) { notice('请选择聊天流', 'error'); return; }
   if (!value) { notice('请填写时间或间隔', 'error'); return; }
   if (!message) { notice('请填写提醒内容', 'error'); return; }
   const args = { stream_id, kind, value, message, repeat, label };
+  if (alarm_id) args.alarm_id = alarm_id;
   if (repeat === 'count') {
     const count = Number($('count').value);
     if (!Number.isInteger(count) || count < 1 || count > 100) { notice('次数需为 1–100 的整数', 'error'); return; }
@@ -308,9 +383,56 @@ async function createAlarm() {
     const result = await maibot.action('create', args);
     if (!result || result.ok !== true) throw new Error((result && result.error) || '创建失败');
     notice(result.content || '已创建闹钟', 'good');
+    $('alarm-id').value = '';
     $('value').value = '';
     $('message').value = '';
     $('label').value = '';
+  } catch (error) {
+    notice(String(error.message || error).replace(/^ApiError:\s*/, ''), 'error');
+  } finally {
+    setBusy(false);
+    void load(true);
+  }
+}
+
+async function saveEdit() {
+  const original = state.original;
+  if (!original) return;
+  const kind = $('kind').value;
+  const value = $('value').value.trim();
+  const repeat = $('repeat').value;
+  const message = $('message').value.trim();
+  const label = $('label').value.trim();
+  if (!value) { notice('请填写时间或间隔', 'error'); return; }
+  if (!message) { notice('请填写提醒内容', 'error'); return; }
+  const args = { alarm_id: state.editing };
+  if (kind !== original.kind) {
+    args.kind = kind;
+    args.value = value;
+  } else if (value !== original.value) {
+    args.value = value;
+  }
+  let count = null;
+  if (repeat === 'count') {
+    count = Number($('count').value);
+    if (!Number.isInteger(count) || count < 1 || count > 100) { notice('次数需为 1–100 的整数', 'error'); return; }
+  }
+  if (repeat !== original.repeat) {
+    args.repeat = repeat;
+    if (repeat === 'count') args.count = count;
+  } else if (repeat === 'count' && count !== original.count) {
+    args.count = count;
+  }
+  if (message !== original.message) args.message = message;
+  if (label !== original.label) args.label = label;
+  if (Object.keys(args).length === 1) { notice('没有修改任何内容', 'error'); return; }
+  setBusy(true);
+  notice('正在保存…');
+  try {
+    const result = await maibot.action('rewrite', args);
+    if (!result || result.ok !== true) throw new Error((result && result.error) || '保存失败');
+    notice(result.content || '已保存修改', 'good');
+    exitEdit();
   } catch (error) {
     notice(String(error.message || error).replace(/^ApiError:\s*/, ''), 'error');
   } finally {
@@ -338,11 +460,13 @@ async function cancelAlarm(alarmId) {
 document.addEventListener('click', event => {
   const node = event.target.closest('button');
   if (!node || node.disabled) return;
-  if (node.dataset.cancel) void cancelAlarm(node.dataset.cancel);
+  if (node.dataset.cancel) { void cancelAlarm(node.dataset.cancel); return; }
+  if (node.dataset.edit) startEditById(node.dataset.edit);
 });
 
 $('refresh').addEventListener('click', () => void load());
-$('create').addEventListener('click', () => void createAlarm());
+$('create').addEventListener('click', () => { if (state.editing) void saveEdit(); else void createAlarm(); });
+$('cancel-edit').addEventListener('click', exitEdit);
 $('kind').addEventListener('change', applyKind);
 $('repeat').addEventListener('change', syncRepeat);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void load(true); });
